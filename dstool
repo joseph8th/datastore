@@ -209,7 +209,7 @@ def init_parser(ds_tool:DataStoreTool) -> argparse.ArgumentParser:
     # Note parent parser func is to ds_tool.set_cache the rest to ds_tool.run
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "-c", "--cache", dest="cache_path",
+        "-c", "--cache", dest="cache_path", required=True,
         help="REQUIRED: directory containing the DataStore cache"
     )
     parser.add_argument("-s", "--shards", default=8, type=int, help="# of shards in NEW caches ONLY")
