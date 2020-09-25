@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import json
+import shlex
+import argparse
+import traceback
+
+from datastore.DataStore import DataStore
+
+# I'd call this self-commenting...
+DEBUG = True
+
+
+# TODO
+def debug_log(*args, **kwargs):
+    """Function to print pretty and optionally try to break a thread at any breakpoint."""
+
+    header = kwargs.get("header", "")
+    die = kwargs.get("die", False)
+    sep = kwargs.get("sep", True)
+    iff = kwargs.get("iff", None)
+    ugly = kwargs.get("ugly", False)
+    color = kwargs.get("color", False)
+
+    if isinstance(iff, bool) and not iff:
+        return
+
+    lgray = "\033[0;37m"
+    red = "\033[0;31m"
+
+    import pprint
+    pp = pprint.PrettyPrinter()
+    if sep:
+        header_str = "{0:-^80}".format(header)
+        if color:
+            header_str = "{0}{1}{2}".format(red, header_str, lgray)
+        print(header_str)
+
+    for msg in args:
+        if ugly:
+            msg = "{0}{1}{2}".format(red, msg, lgray) if color else msg
+            print(msg)
+        else:
+            if color:
+                print(red, end='')
+            pp.pprint(msg)
+            if color:
+                print(lgray, end='')
+
+    if die:
+        sys.exit("DEBUG LOG EXIT!")
+
+
+class DataStoreTool(object):
+
+    args = None
+    cache = None
+
+    # Default values for DataStore.set_cache
+    name = None
+    shards = 8
+    timeout = 0.01    # Default diskcache.FanoutCache timeout
+
+    def _init_cache(self):
+        curr_shards = len([
+            d for d in os.listdir(self.args.cache_path)
+            if d.isnumeric() and os.path.isdir(os.path.join(self.args.cache_path, d))
+        ]) if os.path.exists(self.args.cache_path) else 0
+        shards = curr_shards or self.args.shards
+
+        debug_log("Initializing DataStore in '{0}' with ({1}) shards".format(self.args.cache_path, shards))
+        self.cache = DataStore(self.args.cache_path, shards=shards, timeout=self.args.timeout)
+
+    def set_cache(self, args):
+        """REPL Mode: Will link a DataStore to existing FanoutCache or create new one."""
+
+        del args.func
+        self.args = args
+        try:
+            self._init_cache()
+        except Exception:
+            raise
+
+    ############################################################################
+
+    def run(self, args):
+        """Assumes a promised valid argparse Namespace for transparency."""
+
+        del args.func
+        self.args = args
+        if not hasattr(self, args.subcommand):
+            raise Exception("No subcommand '{0}' exists".format(args.subcommand))
+
+        if not self.cache:
+            try:
+                self._init_cache()
+            except Exception:
+                raise
+
+        func = getattr(self, args.subcommand)
+        func()
+
+    def volume(self):
+        volume = self.cache.volume()
+        debug_log(volume, header="Volume")
+
+    def check(self):
+        warnings = self.cache.warnings()
+        debug_log(warnings, header="Warnings")
+
+    def evict(self):
+        rm_count = self.cache.evict(self.args.tag)
+        debug_log(rm_count, header="({0}) '{1}' Tags Evicted".format(rm_count, self.args.tag))
+
+    def expire(self):
+        rm_count = self.cache.expire()
+        debug_log(rm_count, header="({0}) Items Expired")
+
+    def get(self):
+        key = self.cache.makey(*self.args.key)
+        value = self.cache.get(
+            key,
+            default = self.args.default,
+            expire_time = self.args.expire_time,
+            tag = self.args.tag
+        )
+        debug_log(value, header="Value at '{0}'".format(key))
+
+    def items(self):
+        items = self.cache.items(as_dict=self.args.as_dict)
+        if self.args.count:
+            debug_log(len(items), header="Items Count")
+        else:
+            debug_log(items, header="Items")
+
+    def get_startswith(self):
+        matches = self.cache.get_startswith(
+            self.args.match_elts,
+            match_part = self.args.match_part,
+            as_dict = self.args.as_dict,
+            keys_only = self.args.keys_only,
+            suffix_keys = self.args.suffix_keys
+        )
+        debug_log(matches, header="Startswith: {0}".format(self.args.match_elts))
+
+    def set(self):
+        key = self.cache.makey(*self.args.key)
+        if self.args.value:
+            value = self.args.value
+        elif self.args.json_value:
+            try:
+                value = json.loads(self.args.json_value)
+            except Exception:
+                raise
+        else:
+            raise Exception("No valid value given!")
+
+        method = self.cache.add if self.args.add else self.cache.set
+        method(key, value, expire=self.args.expire, tag=self.args.tag)
+
+    def set_from_dict(self):
+        json_file = os.path.abspath(self.args.json_file)
+        if not os.path.exists(json_file):
+            raise Exception("JSON file not found: " + json_file)
+
+        # Valid JSON?
+        try:
+            with open(json_file, 'r') as fp:
+                data_dict = json.load(fp)
+        except Exception:
+            raise
+
+        # Just gotta be a dict don'cha?
+        if not isinstance(data_dict, dict):
+            raise Exception("Decoded JSON is not a Python dict type")
+
+        # Ok we have a dict. Any nested objects will be values in the DataStore
+        self.cache.set_from_dict(data_dict, add=self.args.add)
+        debug_log("({0}) items set from: {1}".format(len(data_dict), json_file))
+
+    def delete(self):
+        key = self.cache.makey(*self.args.key)
+        confirm = input("Really delete '%s'? [y/N]: " % (key))
+        if not confirm.lower() in ["y", "yes"]:
+            return "Chicken."
+
+        # OK clear for deletion
+        self.cache.delete(key)
+
+    def clear(self):
+        if not self.args.startswith:
+            confirm = input("Really clear the ENTIRE DataStore?! [y/N]: ")
+            if not confirm.lower() in ["y", "yes"]:
+                return "Coward."
+            self.cache.clear()
+        else:
+            startswith = self.cache.makey(*self.args.startswith)
+            confirm = input("Really clear ALL keys starting with '%s'?! [y/N]: " % (startswith))
+            if not confirm.lower() in ["y", "yes"]:
+                return "Popinjay."
+            self.cache.clear_keys(startswith)
+
+
+def init_parser(ds_tool:DataStoreTool) -> argparse.ArgumentParser:
+    """Initialize and return the argparse.ArgumentParser() object."""
+
+    # Note parent parser func is to ds_tool.set_cache the rest to ds_tool.run
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "-c", "--cache", dest="cache_path",
+        help="REQUIRED: directory containing the DataStore cache"
+    )
+    parser.add_argument("-s", "--shards", default=8, type=int, help="# of shards in NEW caches ONLY")
+    parser.add_argument("-t", "--timeout", default=0.01, type=float, help="FanoutCache give-up timeout")
+    parser.add_argument("-n", "--name", help="name of DataStore becomes key prefix like 'name:key:00'")
+    parser.add_argument("-d", "--delim", default=":", help="delimiter between key elements (DEF: ':')")
+    parser.add_argument("-r", "--repl", action="store_true", help="run DataStoreTool in REPL mode")
+    parser.set_defaults(func=ds_tool.set_cache)
+
+    # Build up subcommand parser to interface with the DataStoreTool wrappers.
+    subparsers = parser.add_subparsers(help="sub-command help", dest="subcommand")
+
+    parser_volume = subparsers.add_parser("volume", help="DataStore.volume()")
+    parser_volume.set_defaults(func=ds_tool.run)
+
+    parser_check = subparsers.add_parser("check", help="DataStore.check()")
+    parser_check.add_argument("--fix", action="store_true", help="try to fix during check")
+    parser_check.set_defaults(func=ds_tool.run)
+
+    parser_evict = subparsers.add_parser("evict", help="DataStore.evict()")
+    parser_evict.add_argument("tag", help="tag to evict")
+    parser_evict.set_defaults(func=ds_tool.run)
+
+    parser_expire = subparsers.add_parser("expire", help="DataStore.expire()")
+    parser_expire.set_defaults(func=ds_tool.run)
+
+    parser_get = subparsers.add_parser("get", help="DataStore.get()")
+    parser_get.add_argument("key", nargs="+", help="the delimited or listed key to get")
+    parser_get.add_argument("--default", help="the get `default` kwarg")
+    parser_get.add_argument("--expire_time", action="store_true", help="returns expire time also")
+    parser_get.add_argument("--tag", action="store_true", help="returns tag also")
+    parser_get.set_defaults(func=ds_tool.run)
+
+    parser_items = subparsers.add_parser("items", help="DataStore.items()")
+    parser_items.add_argument("--as_dict", action="store_true", help="return as a dict")
+    parser_items.add_argument("--count", action="store_true", help="return only a count of items")
+    parser_items.set_defaults(func=ds_tool.run)
+
+    parser_get_sw = subparsers.add_parser("get_startswith", help="DataStore.get_startswith()")
+    parser_get_sw.add_argument("match_elts", nargs="+", help="the partial delimited or listed key to match")
+    parser_get_sw.add_argument("--match_part", action="store_true", help="do not add delimiter to last element")
+    parser_get_sw.add_argument("--as_dict", action="store_true", help="return as a dict")
+    parser_get_sw.add_argument("--keys_only", action="store_true", help="return only a list of keys")
+    parser_get_sw.add_argument("--suffix_keys", action="store_true", help="return only non-matching part")
+    parser_get_sw.set_defaults(func=ds_tool.run)
+
+    parser_set = subparsers.add_parser("set", help="DataStore.set()")
+    parser_set.add_argument("key", nargs="+", help="the delimited or listed key to set")
+    parser_set.add_argument("--add", action="store_true", help="use DataStore.add() instead")
+    val_group = parser_set.add_mutually_exclusive_group(required=True)
+    val_group.add_argument("-v", "--value", help="set VALUE")
+    val_group.add_argument("-j", "--json_value", help="decode JSON_VALUE and set as Python object")
+    parser_set.add_argument("--expire", help="expiry in seconds")
+    parser_set.add_argument("--tag", help="set tag for this record")
+    parser_set.set_defaults(func=ds_tool.run)
+
+    parser_set_dict = subparsers.add_parser("set_from_dict", help="DataStore.set_from_dict()")
+    parser_set_dict.add_argument("json_file", help="path to JSON file with flat key-value dict")
+    parser_set_dict.add_argument("--add", action="store_true", help="use DataStore.add() instead")
+    parser_set_dict.set_defaults(func=ds_tool.run)
+
+    parser_delete = subparsers.add_parser("delete", help="DataStore.delete()")
+    parser_delete.add_argument("key", nargs="+", help="the delimited or listed key to delete")
+    parser_delete.set_defaults(func=ds_tool.run)
+
+    parser_clear = subparsers.add_parser("clear", help="DataStore.clear()")
+    parser_clear.add_argument("--startswith", nargs="+", help="use DataStore.clear_keys() instead")
+    parser_clear.set_defaults(func=ds_tool.run)
+
+    return parser
+
+
+### MAIN FUNCTIONS #############################################################
+
+def ds_cli(parser):
+    """Run DataStoreTool in CLI mode and exit."""
+
+    args = parser.parse_args()
+    args.cache_path = os.path.abspath(args.cache_path)
+    return args.func(args)
+
+
+def ds_repl_intro(cache_path=None):
+    print(
+        "CIELO Agent DataStoreTool REPL Mode.\n"
+        "------------------------------------\n"
+        "Subcommands are same as CLI mode. \n"
+        "Options call `set_cache`! Beware changing shards!\n"
+        "Type [-h, --help] for help. Type C-c or [-q, --quit] to quit."
+    )
+    if not cache_path:
+        print(
+            "\nNo DataStore cache path set!\n"
+            "Use [-c PATH, --cache PATH] to set current DataStore."
+        )
+
+
+def ds_repl_die_smiling(errno=None):
+    print(
+        "\n ____\n"
+        "(.   \\\n"
+        "  \  |  \n"
+        "   \ |___(\--/)  MEOW!\n"
+        " __/    (  . . ) /\n"
+        "\"'._.    '-.O.'\n"
+        "     '-.  \ \"|\\\n"
+        "        '.,,/'.,,mrf\n"
+    )
+    return errno
+
+
+def ds_repl(ds_tool, parser, init_cache_path=None):
+    """Run DataStoreTool in REPL mode."""
+
+    from prompt_toolkit.history import InMemoryHistory
+    from prompt_toolkit import prompt
+
+    history = InMemoryHistory()
+    quit_list = ["-q", "--quit"]
+    set_cache_options = {
+        "-c": "cache_path", "--cache": "cache_path",
+        "-s": "shards", "--shards": "shards",
+        "-t": "timeout", "--timeout": "timeout",
+        "-n": "name", "--name": "name",
+        "-d": "delim", "--delim": "delim",
+    }
+
+    ds_repl_intro(init_cache_path)
+    cache_path = init_cache_path
+    while True:
+        prompt_str = "\n{0}> ".format(os.path.basename(cache_path)) if cache_path else "\n> "
+        try:
+            args_str = prompt(prompt_str, history=history)
+            if args_str in quit_list:
+                return ds_repl_die_smiling()
+
+            # Handle empty CR in REPL
+            args_shlex = shlex.split(args_str)
+            if not args_shlex:
+                continue
+
+            args = parser.parse_args(args_shlex)
+            args.cache_path = args.cache_path or cache_path
+            cache_path = args.cache_path
+            errno = args.func(args)
+
+        except OSError as ex:
+            if DEBUG: traceback.print_exc()
+            print("\nException: {}".format(ex))
+            return 1
+        except SystemExit as ex:
+            print(ex)
+        except KeyboardInterrupt:
+            return ds_repl_die_smiling()
+        except Exception as ex:
+            if DEBUG: traceback.print_exc()
+            print("\nException: {}".format(ex))
+
+
+def main():
+    """Bring the pieces together in a beautiful harmony of the spheroids."""
+
+    # Instantiate mindless DataStoreTool so we can access its run() method
+    ds_tool = DataStoreTool()
+    parser = init_parser(ds_tool)
+
+    # CLI or REPL mode?
+    init_cache_path = None
+    repl_mode = False
+    if len(sys.argv) == 2 and sys.argv[1] in ["-r", "--repl"]:
+        repl_mode = True
+    elif len(sys.argv) == 3 and sys.argv[1] in ["-c", "--cache"]:
+        repl_mode = True
+        init_cache_path = os.path.abspath(sys.argv[2])
+
+    if not repl_mode:
+        return ds_cli(parser)
+    else:
+        return ds_repl(ds_tool, parser, init_cache_path=init_cache_path)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
